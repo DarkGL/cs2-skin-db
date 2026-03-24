@@ -73,17 +73,34 @@ _PAIR_RE   = re.compile(r'"([^"]*)"')
 _LOOT_RE   = re.compile(r'^\s*"\[([^\]]+)\](weapon_[^"]+)"')
 
 
-def _parse_vdf(lines: list[str]) -> tuple[dict, dict, dict, set]:
+_ITEM_SET_ENTRY_RE = re.compile(r'^\s*"\[([^\]]+)\](weapon_[^"]+)"')
+
+# Valve internal rarity names → CS2 display rarity names
+RARITY_MAP: dict[str, str] = {
+    "common":    "Consumer Grade",
+    "uncommon":  "Industrial Grade",
+    "rare":      "Mil-Spec Grade",
+    "mythical":  "Restricted",
+    "legendary": "Classified",
+    "ancient":   "Covert",
+}
+
+
+def _parse_vdf(lines: list[str]) -> tuple[dict, dict, set, dict, dict]:
     """
     Single-pass VDF parser.
     Returns:
-        paint_kits  - pk_id (str) -> {name, wear_min, wear_max, description_tag}
-        items_data  - defidx (int) -> {name, item_name}
-        loot_pairs  - set of (pk_name, weapon_class)
+        paint_kits       - pk_id (str) -> {name, wear_min, wear_max, description_tag}
+        items_data       - defidx (int) -> {name, item_name}
+        loot_pairs       - set of (pk_name, weapon_class)
+        item_sets        - set_id (str) -> {name, items: list of (pk_name, weapon_class), knife_pool: str or None}
+        paint_kits_rarity - pk_name (str) -> rarity str (e.g. "common", "rare")
     """
-    paint_kits: dict  = {}
-    items_data: dict  = {}
-    loot_pairs: set   = set()
+    paint_kits: dict        = {}
+    items_data: dict        = {}
+    loot_pairs: set         = set()
+    item_sets: dict         = {}
+    paint_kits_rarity: dict = {}
 
     depth          = 0
     ctx_stack      = []
@@ -98,6 +115,18 @@ def _parse_vdf(lines: list[str]) -> tuple[dict, dict, dict, set]:
     item_depth     = None
     cur_item_id    = None
     cur_item_data  = {}
+
+    in_item_set       = False
+    item_set_depth    = None
+    cur_set_id        = None
+    cur_set_data      = {}
+    in_item_set_items = False
+    item_set_items_depth = None
+    in_item_set_unusuals = False
+    item_set_unusuals_depth = None
+
+    in_pk_rarity      = False
+    pk_rarity_depth   = None
 
     for line in lines:
         s = line.strip()
@@ -120,6 +149,28 @@ def _parse_vdf(lines: list[str]) -> tuple[dict, dict, dict, set]:
                 in_item     = True
                 item_depth  = depth
                 cur_item_data = {}
+
+            # item_sets > set_id
+            if parent == "item_sets" and cur_key and cur_key != "item_sets":
+                in_item_set    = True
+                item_set_depth = depth
+                cur_set_id     = ctx_stack[-1]
+                cur_set_data   = {"name": "", "items": [], "knife_pool": None}
+
+            # item_sets > set_id > items
+            if in_item_set and cur_key == "items" and depth == item_set_depth + 1:
+                in_item_set_items    = True
+                item_set_items_depth = depth
+
+            # item_sets > set_id > unusuals
+            if in_item_set and cur_key == "unusuals" and depth == item_set_depth + 1:
+                in_item_set_unusuals    = True
+                item_set_unusuals_depth = depth
+
+            # paint_kits_rarity
+            if cur_key == "paint_kits_rarity":
+                in_pk_rarity    = True
+                pk_rarity_depth = depth
 
             cur_key = None
             continue
@@ -144,6 +195,21 @@ def _parse_vdf(lines: list[str]) -> tuple[dict, dict, dict, set]:
                         pass
                 in_item    = False
                 cur_item_id = None
+
+            if in_item_set_unusuals and depth == item_set_unusuals_depth:
+                in_item_set_unusuals = False
+
+            if in_item_set_items and depth == item_set_items_depth:
+                in_item_set_items = False
+
+            if in_item_set and depth == item_set_depth:
+                if cur_set_id and cur_set_data.get("items"):
+                    item_sets[cur_set_id] = cur_set_data.copy()
+                in_item_set = False
+                cur_set_id  = None
+
+            if in_pk_rarity and depth == pk_rarity_depth:
+                in_pk_rarity = False
 
             if ctx_stack:
                 ctx_stack.pop()
@@ -174,11 +240,29 @@ def _parse_vdf(lines: list[str]) -> tuple[dict, dict, dict, set]:
             if in_item and key in ("name", "item_name"):
                 cur_item_data[key] = val
 
+            # item_sets > set_id > "name"
+            if in_item_set and not in_item_set_items and key == "name":
+                cur_set_data["name"] = val
+
+            # item_sets > set_id > items > "[pk_name]weapon_class" "1"
+            if in_item_set_items:
+                m = _ITEM_SET_ENTRY_RE.match(line)
+                if m:
+                    cur_set_data["items"].append((m.group(1), m.group(2)))
+
+            # item_sets > set_id > unusuals > "unique" "knife_pool_name"
+            if in_item_set_unusuals and key == "unique":
+                cur_set_data["knife_pool"] = val
+
+            # paint_kits_rarity > "pk_name" "rarity"
+            if in_pk_rarity:
+                paint_kits_rarity[key] = val
+
             m = _LOOT_RE.match(line)
             if m:
                 loot_pairs.add((m.group(1), m.group(2)))
 
-    return paint_kits, items_data, loot_pairs
+    return paint_kits, items_data, loot_pairs, item_sets, paint_kits_rarity
 
 
 def _parse_locale(lines: list[str]) -> dict[str, str]:
@@ -257,6 +341,18 @@ WEAPON_NAMES: dict[str, str] = {
 KNIFE_CLASSES: set[str] = {c for c in WEAPON_NAMES if "knife" in c or c == "weapon_bayonet"}
 GLOVE_PAINT_KIT_THRESHOLD = 10006  # paint_index >= this are glove kits
 
+GLOVE_NAMES: dict[str, str] = {
+    "studded_bloodhound_gloves": "Bloodhound Gloves",
+    "sporty_gloves":             "Sport Gloves",
+    "slick_gloves":              "Driver Gloves",
+    "leather_handwraps":         "Hand Wraps",
+    "motorcycle_gloves":         "Moto Gloves",
+    "specialist_gloves":         "Specialist Gloves",
+    "studded_hydra_gloves":      "Hydra Gloves",
+    "studded_brokenfang_gloves": "Broken Fang Gloves",
+}
+GLOVE_CLASSES: set[str] = set(GLOVE_NAMES.keys())
+
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main(force_download: bool = False):
@@ -271,12 +367,14 @@ def main(force_download: bool = False):
 
     # 2. Parse
     print("\n[2] Parsing...")
-    paint_kits, items_data, loot_pairs = _parse_vdf(items_lines)
+    paint_kits, items_data, loot_pairs, item_sets, pk_rarity_map = _parse_vdf(items_lines)
     locale = _parse_locale(english_lines)
-    print(f"  Paint kits : {len(paint_kits)}")
-    print(f"  Item defs  : {len(items_data)}")
-    print(f"  Loot pairs : {len(loot_pairs)}")
-    print(f"  Locale keys: {len(locale)}")
+    print(f"  Paint kits       : {len(paint_kits)}")
+    print(f"  Item defs        : {len(items_data)}")
+    print(f"  Loot pairs       : {len(loot_pairs)}")
+    print(f"  Item sets (colls): {len(item_sets)}")
+    print(f"  PK rarity entries: {len(pk_rarity_map)}")
+    print(f"  Locale keys      : {len(locale)}")
 
     # 3. Build lookup tables
     print("\n[3] Building lookup tables...")
@@ -318,9 +416,46 @@ def main(force_download: bool = False):
         and int(pk_id) < GLOVE_PAINT_KIT_THRESHOLD
     }
 
+    # Glove defindexes
+    glove_defidx: dict[int, tuple[str, str]] = {}  # defidx -> (class, display)
+    for did, d in items_data.items():
+        cls = d.get("name", "")
+        if cls in GLOVE_CLASSES:
+            display = GLOVE_NAMES.get(cls, cls)
+            glove_defidx[did] = (cls, display)
+
+    # Glove paint kits = paint kits with pk_id >= threshold
+    glove_pks: dict[str, dict] = {
+        pk_id: pk_data
+        for pk_id, pk_data in paint_kits.items()
+        if int(pk_id) >= GLOVE_PAINT_KIT_THRESHOLD
+        and pk_data["name"] not in ("default", "workshop_default")
+    }
+
+    # Build (pk_name, weapon_class) -> collection name lookup
+    # Build (pk_name, weapon_class) -> knife_pool lookup
+    pk_weapon_to_collection: dict[tuple[str, str], str] = {}
+    pk_weapon_to_knife_pool: dict[tuple[str, str], str] = {}
+    for set_id, set_data in item_sets.items():
+        coll_name = loc(locale, set_data["name"]) if set_data["name"] else set_id
+        knife_pool = set_data.get("knife_pool")
+        for pk_name, weapon_class in set_data["items"]:
+            pk_weapon_to_collection[(pk_name, weapon_class)] = coll_name
+            if knife_pool:
+                pk_weapon_to_knife_pool[(pk_name, weapon_class)] = knife_pool
+
+    # Build pk_name -> rarity display name lookup
+    pk_name_to_rarity: dict[str, str] = {}
+    for pk_name, valve_rarity in pk_rarity_map.items():
+        pk_name_to_rarity[pk_name] = RARITY_MAP.get(valve_rarity, valve_rarity)
+
     print(f"  Weapon defindexes : {len(defidx_to_class)}")
     print(f"  Knife defindexes  : {len(knife_defidx)}")
     print(f"  Knife paint kits  : {len(knife_pks)}")
+    print(f"  Glove defindexes  : {len(glove_defidx)}")
+    print(f"  Glove paint kits  : {len(glove_pks)}")
+    print(f"  PK→collection map: {len(pk_weapon_to_collection)}")
+    print(f"  PK→rarity map    : {len(pk_name_to_rarity)}")
 
     # 4. Build skin list (weapon skins)
     print("\n[4] Building weapon skin list...")
@@ -336,6 +471,9 @@ def main(force_download: bool = False):
         skin_display   = loc(locale, pk_data["description_tag"]) if pk_data["description_tag"] else pk_name
         is_knife       = weapon_class in KNIFE_CLASSES
         prefix         = "\u2605 " if is_knife else ""
+        collection     = pk_weapon_to_collection.get((pk_name, weapon_class))
+        rarity         = pk_name_to_rarity.get(pk_name)
+        knife_pool     = pk_weapon_to_knife_pool.get((pk_name, weapon_class))
         weapon_skins.append({
             "defindex":          defidx,
             "weapon_class":      weapon_class,
@@ -346,6 +484,10 @@ def main(force_download: bool = False):
             "market_hash_name":  f"{prefix}{weapon_display} | {skin_display}",
             "wear_min":          pk_data["wear_min"],
             "wear_max":          pk_data["wear_max"],
+            "collection":        collection,
+            "rarity":            rarity,
+            "knife_pool":        knife_pool,
+            "stattrak_available": knife_pool is not None,
         })
 
     weapon_skins.sort(key=lambda x: (x["defindex"], x["paint_index"]))
@@ -357,6 +499,7 @@ def main(force_download: bool = False):
 
     for pk_id, pk_data in sorted(knife_pks.items(), key=lambda x: int(x[0])):
         skin_display = loc(locale, pk_data["description_tag"]) if pk_data["description_tag"] else pk_data["name"]
+        rarity       = pk_name_to_rarity.get(pk_data["name"])
         for defidx, (cls, knife_display) in sorted(knife_defidx.items()):
             knife_skins.append({
                 "defindex":         defidx,
@@ -368,16 +511,47 @@ def main(force_download: bool = False):
                 "market_hash_name": f"\u2605 {knife_display} | {skin_display}",
                 "wear_min":         pk_data["wear_min"],
                 "wear_max":         pk_data["wear_max"],
+                "collection":       None,
+                "rarity":           rarity,
+                "knife_pool":       None,
+                "stattrak_available": True,
             })
 
     knife_skins.sort(key=lambda x: (x["defindex"], x["paint_index"]))
     print(f"  Knife skins: {len(knife_skins)}")
 
-    all_skins = weapon_skins + knife_skins
+    # 6. Build glove skin list (all glove types × all glove paint kits)
+    print("\n[6] Building glove skin list...")
+    glove_skins: list[dict] = []
+
+    for pk_id, pk_data in sorted(glove_pks.items(), key=lambda x: int(x[0])):
+        skin_display = loc(locale, pk_data["description_tag"]) if pk_data["description_tag"] else pk_data["name"]
+        rarity       = pk_name_to_rarity.get(pk_data["name"])
+        for defidx, (cls, glove_display) in sorted(glove_defidx.items()):
+            glove_skins.append({
+                "defindex":         defidx,
+                "weapon_class":     cls,
+                "weapon":           glove_display,
+                "paint_index":      int(pk_id),
+                "paint_kit_name":   pk_data["name"],
+                "skin":             skin_display,
+                "market_hash_name": f"\u2605 {glove_display} | {skin_display}",
+                "wear_min":         pk_data["wear_min"],
+                "wear_max":         pk_data["wear_max"],
+                "collection":       None,
+                "rarity":           rarity,
+                "knife_pool":       None,
+                "stattrak_available": False,  # StatTrak gloves don't exist
+            })
+
+    glove_skins.sort(key=lambda x: (x["defindex"], x["paint_index"]))
+    print(f"  Glove skins: {len(glove_skins)}")
+
+    all_skins = weapon_skins + knife_skins + glove_skins
     all_skins.sort(key=lambda x: (x["defindex"], x["paint_index"]))
 
-    # 6. Write files
-    print("\n[6] Writing output files...")
+    # 7. Write files
+    print("\n[7] Writing output files...")
 
     def write_json(path: Path, data):
         path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -394,6 +568,10 @@ def main(force_download: bool = False):
             "paint_kit_name":   s["paint_kit_name"],
             "wear_min":         s["wear_min"],
             "wear_max":         s["wear_max"],
+            "collection":       s.get("collection"),
+            "rarity":           s.get("rarity"),
+            "knife_pool":       s.get("knife_pool"),
+            "stattrak_available": s.get("stattrak_available", False),
         }
         for s in all_skins
     ]
@@ -402,8 +580,8 @@ def main(force_download: bool = False):
     # skin-market-mapping.xlsx
     _write_excel(OUT_DIR / "skin-market-mapping.xlsx", market_rows)
 
-    # 7. Verification
-    print("\n[7] Verification samples:")
+    # 8. Verification
+    print("\n[8] Verification samples:")
     _verify(all_skins)
 
     print("\nDone!")
@@ -475,7 +653,8 @@ def _write_excel(path: Path, rows: list[dict]):
     ws.title = "Skin Market Mapping"
 
     headers = ["defindex", "paint_index", "market_hash_name", "weapon",
-               "skin_name", "paint_kit_name", "wear_min", "wear_max"]
+               "skin_name", "paint_kit_name", "wear_min", "wear_max",
+               "collection", "rarity", "knife_pool"]
     ws.append(headers)
 
     hdr_font = Font(bold=True, color="FFFFFF")
@@ -490,10 +669,11 @@ def _write_excel(path: Path, rows: list[dict]):
             r["defindex"], r["paint_index"], r["market_hash_name"],
             r["weapon"], r["skin"], r["paint_kit_name"],
             r["wear_min"], r["wear_max"],
+            r.get("collection", ""), r.get("rarity", ""), r.get("knife_pool", ""),
         ])
 
-    for col, width in zip(["A","B","C","D","E","F","G","H"],
-                           [12,  12,  52,  22,  30,  40,  12,  12]):
+    for col, width in zip(["A","B","C","D","E","F","G","H","I","J","K"],
+                           [12,  12,  52,  22,  30,  40,  12,  12,  35,  20,  30]):
         ws.column_dimensions[col].width = width
 
     wb.save(path)
